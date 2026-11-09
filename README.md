@@ -10,7 +10,7 @@ Requires macOS 14+ on Apple silicon.
 brew trust docker/tap
 brew bundle
 sbx login
-ln -s "$PWD/rsbx" ~/.local/bin/rsbx
+ln -s "$PWD/rsbx" ~/.local/bin/rsbx  # or any other directory on your PATH
 ```
 
 ## Usage
