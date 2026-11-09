@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# rsbx: interactive launcher for Claude Code in Docker Sandboxes (sbx).
+# Written for bash 3.2, the version macOS ships.
+set -eu
+
+PROJECTS_DIR="${RSBX_PROJECTS_DIR:-$HOME/workspace}"
+OTHER_PATH="+ other path..."
+DRY_RUN=0
+
+usage() {
+  cat <<EOF
+Usage: rsbx [-n|--dry-run] [-h|--help]
+
+Choose an existing sandbox or configure a new one, then launch Claude Code.
+
+  -n, --dry-run   Print the sbx command that launches a sandbox, without running it
+  -h, --help      Show this help
+
+Environment:
+  RSBX_PROJECTS_DIR   Directory listing mountable projects (default: ~/workspace)
+EOF
+}
+
+die() {
+  printf 'rsbx: %s\n' "$1" >&2
+  exit 1
+}
+
+require() {
+  command -v "$1" >/dev/null 2>&1 && return
+  printf 'rsbx: %s is not installed. Install it with:\n  %s\n' "$1" "$2" >&2
+  exit 127
+}
+
+# Print a command in copy-pasteable form, then replace this process with it.
+launch() {
+  printf '\n$'
+  printf ' %q' "$@"
+  printf '\n\n'
+  [ "$DRY_RUN" -eq 1 ] && exit 0
+  exec "$@"
+}
+
+# Yes/no prompt defaulting to no. Ctrl-C quits rather than answering no.
+ask() {
+  local status=0
+  gum confirm --default=false "$1" || status=$?
+  [ "$status" -ne 130 ] || exit 130
+  return "$status"
+}
+
+# Absolute path of a directory, expanding a leading ~.
+resolve_dir() {
+  # shellcheck disable=SC2088  # matching a literal tilde typed at a prompt
+  case "$1" in
+    "~") set -- "$HOME" ;;
+    "~/"*) set -- "$HOME/${1#"~/"}" ;;
+  esac
+  (cd -- "$1" 2>/dev/null && pwd)
+}
+
+add_project() {
+  local existing
+  for existing in ${PROJECTS[@]+"${PROJECTS[@]}"}; do
+    [ "$existing" = "$1" ] && return
+  done
+  PROJECTS+=("$1")
+}
+
+select_projects() {
+  local listing="" preselect=() chosen choice entered path dir
+
+  for dir in "$PROJECTS_DIR"/*/; do
+    [ -d "$dir" ] || continue
+    dir="${dir%/}"
+    listing="$listing${dir##*/}"$'\n'
+  done
+
+  # gum splits --selected on commas, so a name containing one can't be preselected.
+  case "$PWD" in
+    "$PROJECTS_DIR"/*/* | *,*) ;;
+    "$PROJECTS_DIR"/*) preselect=("--selected=${PWD##*/}") ;;
+  esac
+
+  chosen=$(printf '%s%s\n' "$listing" "$OTHER_PATH" |
+    gum filter --no-limit --header "Projects to mount (tab selects, enter confirms)" \
+      ${preselect[@]+"${preselect[@]}"})
+
+  # Read from fd 3 so that gum input below keeps the terminal on stdin.
+  PROJECTS=()
+  while IFS= read -r choice <&3; do
+    if [ "$choice" = "$OTHER_PATH" ]; then
+      while :; do
+        # shellcheck disable=SC2088  # literal placeholder text
+        entered=$(gum input --header "Directory to mount (empty to finish)" \
+          --placeholder "~/path/to/project")
+        [ -n "$entered" ] || break
+        if path=$(resolve_dir "$entered"); then
+          add_project "$path"
+        else
+          gum log --level warn "Not a directory: $entered"
+        fi
+      done
+    elif [ -n "$choice" ]; then
+      add_project "$PROJECTS_DIR/$choice"
+    fi
+  done 3<<EOF
+$chosen
+EOF
+
+  [ "${#PROJECTS[@]}" -gt 0 ] || die "no projects selected"
+}
+
+# Reorder PROJECTS so the workspace the agent starts in comes first.
+select_primary() {
+  local primary path others=()
+  [ "${#PROJECTS[@]}" -gt 1 ] || return 0
+
+  primary=$(printf '%s\n' "${PROJECTS[@]}" | gum choose --header "Primary workspace (Claude starts here)")
+  [ -n "$primary" ] || die "no primary workspace selected"
+
+  for path in "${PROJECTS[@]}"; do
+    [ "$path" = "$primary" ] || others+=("$path")
+  done
+  PROJECTS=("$primary" "${others[@]}")
+}
+
+# sbx only accepts :ro on extra workspaces, so the primary is always writable.
+build_mounts() {
+  local read_only="" path i
+  MOUNTS=("${PROJECTS[0]}")
+  [ "${#PROJECTS[@]}" -gt 1 ] || return 0
+
+  read_only=$(printf '%s\n' "${PROJECTS[@]:1}" |
+    gum choose --no-limit --header "Mount read-only (none selected: all writable)")
+
+  for ((i = 1; i < ${#PROJECTS[@]}; i++)); do
+    path="${PROJECTS[$i]}"
+    if printf '%s\n' "$read_only" | grep -Fxq -- "$path"; then
+      MOUNTS+=("$path:ro")
+    else
+      MOUNTS+=("$path")
+    fi
+  done
+}
+
+default_name() {
+  local base="${1##*/}"
+  base=$(printf '%s' "$base" | tr -c 'A-Za-z0-9.-' '-')
+  printf 'claude-%s' "$base"
+}
+
+# Runs inside $(...), where bash turns off set -e, so cancelling must exit explicitly.
+select_name() {
+  local suggested="$1" name
+  while :; do
+    name=$(gum input --header "Sandbox name" --value "$suggested") || exit 130
+    if ! printf '%s' "$name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.-]+$' || [ "$name" = default ]; then
+      gum log --level warn "Use 2+ letters, numbers, hyphens or periods, starting with a letter or number (not 'default')" >&2
+    elif printf '%s\n' "$SANDBOXES" | grep -Fxq -- "$name"; then
+      gum log --level warn "A sandbox named $name already exists" >&2
+    else
+      printf '%s' "$name"
+      return
+    fi
+    suggested="$name"
+  done
+}
+
+create_sandbox() {
+  local name memory="" cpus="" flags=()
+
+  select_projects
+  select_primary
+  build_mounts
+  name=$(default_name "${PROJECTS[0]}")
+  name=$(select_name "$name")
+
+  # A .git file marks a linked worktree, which sbx refuses to clone from.
+  if [ -d "${PROJECTS[0]}/.git" ] &&
+    ask "Use clone mode? Claude works on a private clone instead of your checkout"; then
+    flags+=(--clone)
+  fi
+
+  if ask "Set CPU and memory limits?"; then
+    cpus=$(gum input --header "CPUs (empty: all host CPUs)" --placeholder "4")
+    memory=$(gum input --header "Memory (empty: 50% of host memory)" --placeholder "8g")
+    [ -z "$cpus" ] || flags+=(--cpus "$cpus")
+    [ -z "$memory" ] || flags+=(--memory "$memory")
+  fi
+
+  launch sbx run --name "$name" ${flags[@]+"${flags[@]}"} claude "${MOUNTS[@]}"
+}
+
+open_sandbox() {
+  local name
+  name=$(printf '%s\n' "$SANDBOXES" | gum filter --header "Sandbox to open")
+  [ -n "$name" ] || die "no sandbox selected"
+  launch sbx run --name "$name"
+}
+
+# Set NAMES to the sandboxes picked; exits if there are none.
+pick_sandboxes() {
+  local chosen name
+  chosen=$(printf '%s\n' "$SANDBOXES" |
+    gum filter --no-limit --header "$1 (tab selects, enter confirms)")
+
+  NAMES=()
+  while IFS= read -r name; do
+    [ -z "$name" ] || NAMES+=("$name")
+  done <<EOF
+$chosen
+EOF
+  [ "${#NAMES[@]}" -gt 0 ] || exit 0
+}
+
+stop_sandboxes() {
+  pick_sandboxes "Sandboxes to stop"
+  sbx stop "${NAMES[@]}"
+}
+
+remove_sandboxes() {
+  pick_sandboxes "Sandboxes to remove"
+  # gum replaces sbx's own prompt. --force also deletes a sandbox that's in use.
+  ask "Permanently remove ${NAMES[*]}? This works even if in use, and unpushed clone-mode work is lost." ||
+    exit 0
+  sbx rm --force "${NAMES[@]}"
+}
+
+main() {
+  local action
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -n | --dry-run) DRY_RUN=1 ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        usage >&2
+        exit 2
+        ;;
+    esac
+    shift
+  done
+
+  require gum "brew install gum"
+  require sbx "brew trust docker/tap && brew install docker/tap/sbx"
+
+  SANDBOXES=$(sbx ls -q) || die "could not list sandboxes; run 'sbx login' if you are not signed in"
+
+  if [ -z "$SANDBOXES" ]; then
+    create_sandbox
+    return
+  fi
+
+  sbx ls
+  echo
+  action=$(gum choose --header "What do you want to do?" \
+    "Open an existing sandbox" "Create a new sandbox" "Stop sandboxes" "Remove sandboxes")
+
+  case "$action" in
+    "Open an existing sandbox") open_sandbox ;;
+    "Create a new sandbox") create_sandbox ;;
+    "Stop sandboxes") stop_sandboxes ;;
+    "Remove sandboxes") remove_sandboxes ;;
+  esac
+}
+
+main "$@"
