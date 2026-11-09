@@ -20,4 +20,6 @@ rsbx            # interactive
 rsbx --dry-run  # print the sbx command instead of running it
 ```
 
-Projects are listed from `$GIT_PROJECTS_ROOT` (default: `~`).
+Pick projects from `$GIT_PROJECTS_ROOT` (default: `~`) to mount into the sandbox VM at the same paths as on the host. Claude starts in the one you choose as primary.
+
+Each sandbox is a separate named VM (default `claude-<project>`) with its own mounts, so you can keep one per project and run several at once. Run `rsbx` again to reopen, stop or remove them.
