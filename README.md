@@ -7,9 +7,8 @@ Interactive launcher for Claude Code in [Docker Sandboxes](https://docs.docker.c
 Requires macOS 14+ on Apple silicon.
 
 ```sh
-brew install gum
 brew trust docker/tap
-brew install docker/tap/sbx
+brew bundle
 sbx login
 ln -s "$PWD/rsbx" ~/.local/bin/rsbx
 ```
