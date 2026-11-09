@@ -3,7 +3,7 @@
 # Written for bash 3.2, the version macOS ships.
 set -eu
 
-PROJECTS_DIR="${RSBX_PROJECTS_DIR:-$HOME/workspace}"
+PROJECTS_DIR="${GIT_PROJECTS_ROOT:-$HOME}"
 OTHER_PATH="+ other path..."
 DRY_RUN=0
 
@@ -17,7 +17,7 @@ Choose an existing sandbox or configure a new one, then launch Claude Code.
   -h, --help      Show this help
 
 Environment:
-  RSBX_PROJECTS_DIR   Directory listing mountable projects (default: ~/workspace)
+  GIT_PROJECTS_ROOT   Directory listing mountable projects (default: ~)
 EOF
 }
 
