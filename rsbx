@@ -41,6 +41,19 @@ launch() {
   exec "$@"
 }
 
+# Copy host skills (~/.agents/skills first, then other agents' dirs) into sbx's
+# shared store, which each sandbox links into ~/.claude/skills when it starts.
+# Re-run on every launch so edits on the host reach the store. Skills deleted
+# on the host stay in the store until 'sbx skills rm'.
+sync_skills() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\n$ sbx skills import --force'
+    return
+  fi
+  sbx skills import --force >/dev/null ||
+    gum log --level warn "Could not import skills; run 'sbx skills import' to see why"
+}
+
 # Yes/no prompt defaulting to no. Ctrl-C quits rather than answering no.
 ask() {
   local status=0
@@ -189,6 +202,7 @@ create_sandbox() {
     [ -z "$memory" ] || flags+=(--memory "$memory")
   fi
 
+  sync_skills
   launch sbx run --name "$name" ${flags[@]+"${flags[@]}"} claude "${MOUNTS[@]}"
 }
 
@@ -196,6 +210,7 @@ open_sandbox() {
   local name
   name=$(printf '%s\n' "$SANDBOXES" | gum filter --header "Sandbox to open")
   [ -n "$name" ] || die "no sandbox selected"
+  sync_skills
   launch sbx run --name "$name"
 }
 
