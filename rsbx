@@ -41,6 +41,49 @@ launch() {
   exec "$@"
 }
 
+# Print a command in copy-pasteable form, then run it (unless --dry-run).
+step() {
+  printf '\n$'
+  printf ' %q' "$@"
+  printf '\n'
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  "$@"
+}
+
+# Runs inside the sandbox as bash -c. Replaces any lines it wrote before, and
+# rewrites the env file in place because its directory, /etc, isn't writable.
+# The env file is sourced before every shell command in the sandbox.
+read -r -d '' IDENTITY_SCRIPT <<'EOF' || true
+set -eu
+f=/etc/sandbox-persistent.sh
+m="# rsbx-git-identity"
+tmp=$(mktemp)
+grep -vF "$m" "$f" >"$tmp" 2>/dev/null || true
+for role in AUTHOR COMMITTER; do
+  printf "export GIT_%s_NAME=%q GIT_%s_EMAIL=%q %s\n" \
+    "$role" "$RSBX_GIT_NAME" "$role" "$RSBX_GIT_EMAIL" "$m"
+done >>"$tmp"
+cat "$tmp" >"$f"
+rm -f "$tmp"
+EOF
+
+# Copy the host's global git identity into a sandbox. Without one, git in the
+# sandbox commits as agent@<sandbox>.docker.internal.
+set_git_identity() {
+  local name email
+  name=$(git config --global user.name 2>/dev/null) || name=""
+  email=$(git config --global user.email 2>/dev/null) || email=""
+  if [ -z "$name" ] || [ -z "$email" ]; then
+    gum log --level warn "No global git user.name/user.email on this machine; sandbox commits will use git's default identity"
+    return 0
+  fi
+  printf '\n$ sbx exec %q bash -c <set git identity: %s <%s>>\n' "$1" "$name" "$email"
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  sbx exec -e "RSBX_GIT_NAME=$name" -e "RSBX_GIT_EMAIL=$email" \
+    "$1" bash -c "$IDENTITY_SCRIPT" ||
+    gum log --level warn "Could not set the git identity in $1"
+}
+
 # Copy host skills (~/.agents/skills first, then other agents' dirs) into sbx's
 # shared store, which each sandbox links into ~/.claude/skills when it starts.
 # Re-run on every launch so edits on the host reach the store. Skills deleted
@@ -203,7 +246,10 @@ create_sandbox() {
   fi
 
   sync_skills
-  launch sbx run --name "$name" ${flags[@]+"${flags[@]}"} claude "${MOUNTS[@]}"
+  step sbx create --name "$name" ${flags[@]+"${flags[@]}"} claude "${MOUNTS[@]}" ||
+    die "could not create sandbox $name"
+  set_git_identity "$name"
+  launch sbx run --name "$name"
 }
 
 open_sandbox() {
@@ -211,6 +257,7 @@ open_sandbox() {
   name=$(printf '%s\n' "$SANDBOXES" | gum filter --header "Sandbox to open")
   [ -n "$name" ] || die "no sandbox selected"
   sync_skills
+  set_git_identity "$name"
   launch sbx run --name "$name"
 }
 
