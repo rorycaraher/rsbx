@@ -67,14 +67,17 @@ cat "$tmp" >"$f"
 rm -f "$tmp"
 EOF
 
-# Copy the host's global git identity into a sandbox. Without one, git in the
-# sandbox commits as agent@<sandbox>.docker.internal.
+# Copy the host's git identity for project directory $2 into sandbox $1.
+# Without one, git in the sandbox commits as agent@<sandbox>.docker.internal.
+# Reading config from inside the project (not with --global, which skips
+# includes) honors include and includeIf "gitdir:..." the way a commit would.
 set_git_identity() {
-  local name email
-  name=$(git config --global user.name 2>/dev/null) || name=""
-  email=$(git config --global user.email 2>/dev/null) || email=""
+  local dir="$2" name email
+  [ -d "$dir" ] || dir="$HOME"
+  name=$(git -C "$dir" config user.name 2>/dev/null) || name=""
+  email=$(git -C "$dir" config user.email 2>/dev/null) || email=""
   if [ -z "$name" ] || [ -z "$email" ]; then
-    gum log --level warn "No global git user.name/user.email on this machine; sandbox commits will use git's default identity"
+    gum log --level warn "No git user.name/user.email for $dir; sandbox commits will use git's default identity"
     return 0
   fi
   printf '\n$ sbx exec %q bash -c <set git identity: %s <%s>>\n' "$1" "$name" "$email"
@@ -248,16 +251,20 @@ create_sandbox() {
   sync_skills
   step sbx create --name "$name" ${flags[@]+"${flags[@]}"} claude "${MOUNTS[@]}" ||
     die "could not create sandbox $name"
-  set_git_identity "$name"
+  set_git_identity "$name" "${PROJECTS[0]}"
   launch sbx run --name "$name"
 }
 
 open_sandbox() {
-  local name
+  local name dir=""
   name=$(printf '%s\n' "$SANDBOXES" | gum filter --header "Sandbox to open")
   [ -n "$name" ] || die "no sandbox selected"
   sync_skills
-  set_git_identity "$name"
+  # Workspaces are mounted at their host paths, so the sandbox's working
+  # directory is the primary project on the host too. Skipped in a dry run
+  # because exec starts a stopped sandbox.
+  [ "$DRY_RUN" -eq 1 ] || dir=$(sbx exec "$name" pwd 2>/dev/null) || dir=""
+  set_git_identity "$name" "$dir"
   launch sbx run --name "$name"
 }
 
