@@ -87,6 +87,25 @@ set_git_identity() {
     gum log --level warn "Could not set the git identity in $1"
 }
 
+# Give sandbox $1 the host's GitHub token as an sbx secret. The sandbox proxy
+# injects it into HTTPS requests to GitHub, so git push and gh work inside
+# without 'gh auth login' (gh auth status still reports logged out).
+set_github_secret() {
+  local token
+  if ! command -v gh >/dev/null 2>&1; then
+    gum log --level warn "gh is not installed; skipping the GitHub secret (install with: brew install gh)"
+    return 0
+  fi
+  printf '\n$ sbx secret set github --sandbox %q -t "$(gh auth token)"\n' "$1"
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  if ! token=$(gh auth token 2>/dev/null) || [ -z "$token" ]; then
+    gum log --level warn "No GitHub token from 'gh auth token'; run 'gh auth login' on the host, then: sbx secret set github --sandbox $1 -t \"\$(gh auth token)\""
+    return 0
+  fi
+  sbx secret set github --sandbox "$1" -t "$token" >/dev/null ||
+    gum log --level warn "Could not set the GitHub secret in $1"
+}
+
 # Copy host skills (~/.agents/skills first, then other agents' dirs) into sbx's
 # shared store, which each sandbox links into ~/.claude/skills when it starts.
 # Re-run on every launch so edits on the host reach the store. Skills deleted
@@ -251,6 +270,7 @@ create_sandbox() {
   sync_skills
   step sbx create --name "$name" ${flags[@]+"${flags[@]}"} claude "${MOUNTS[@]}" ||
     die "could not create sandbox $name"
+  set_github_secret "$name"
   set_git_identity "$name" "${PROJECTS[0]}"
   launch sbx run --name "$name"
 }

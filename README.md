@@ -26,4 +26,6 @@ Each sandbox is a separate named VM (default `claude-<project>`) with its own mo
 
 Before each launch, `rsbx` copies the git `user.name` and `user.email` that apply to the primary project (honoring `include` and `includeIf`) into the sandbox's `/etc/sandbox-persistent.sh`, so Claude's commits are authored as you rather than `agent@<sandbox>.docker.internal`.
 
+When it creates a sandbox, `rsbx` stores your host's GitHub token (`gh auth token`) as that sandbox's `github` secret, so `git push` and `gh` work inside without `gh auth login`. `gh auth status` in the sandbox still reports logged out; that's expected. It's skipped with a warning if `gh` isn't installed or logged in on the host.
+
 Before each launch, `rsbx` also runs `sbx skills import --force`, copying skills from `~/.agents/skills` (then `~/.claude/skills`, `~/.cursor/skills`, etc.; the first copy of each name wins) into sbx's shared store. Sandboxes see them in `~/.claude/skills` from their next start, so stop a running sandbox (`rsbx` → Stop) to pick up new skills. Skills deleted on the host stay in the store until `sbx skills rm <name>`.
