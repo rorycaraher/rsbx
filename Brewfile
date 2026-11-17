@@ -1,4 +1,5 @@
 tap "docker/tap"
 brew "gum"
+brew "fzf"
 brew "docker/tap/sbx"
 brew "gh"

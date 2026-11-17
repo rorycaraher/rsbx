@@ -130,6 +130,20 @@ prompt() {
   return "$status"
 }
 
+# fzf list picker over stdin, storing the chosen lines in ANSWER. $1 is the
+# header; the rest are extra fzf flags. Returns 1 on Esc; exits rsbx on
+# Ctrl-C. fzf exits 130 for both, so Esc is rebound to exit 1. (gum filter
+# needs two Escs: the first only leaves its search box.) accept-non-empty
+# stops Enter returning nothing when the search matches nothing.
+pick() {
+  local header="$1" status=0
+  shift
+  ANSWER=$(fzf --height=~50% --layout=reverse --header-first --header="$header" \
+    --bind 'esc:become(exit 1)' --bind 'enter:accept-non-empty' "$@") || status=$?
+  [ "$status" -ne 130 ] || exit 130
+  return "$status"
+}
+
 # Yes/no question, defaulting to no. Sets ANSWER to Yes or No; returns 1 on
 # Esc. Uses gum choose because gum confirm reports Esc the same as No.
 ask() {
@@ -239,41 +253,35 @@ WANT_OTHER=0
 
 # Step: choose projects from the roots. Sets PICKED and WANT_OTHER.
 step_projects() {
-  local preselect="" label i
+  local start="" label i
   # Preselect the previous picks when coming back, else the project at $PWD.
-  # gum splits --selected on commas, so a name containing one can't be preselected.
+  # fzf's pos() counts from 1.
   [ "$PICKED_BEFORE" -eq 1 ] || PICKED=("$PWD")
   for ((i = 0; i < ${#DIRS[@]}; i++)); do
-    label="${LABELS[$i]}"
-    case "$label" in *,*) continue ;; esac
     if contains "${DIRS[$i]}" ${PICKED[@]+"${PICKED[@]}"}; then
-      preselect="${preselect:+$preselect,}$label"
+      start="${start}pos($((i + 1)))+toggle+"
     fi
   done
-  [ "$WANT_OTHER" -eq 0 ] || preselect="${preselect:+$preselect,}$OTHER_PATH"
+  [ "$WANT_OTHER" -eq 0 ] || start="${start}pos($((${#DIRS[@]} + 1)))+toggle+"
 
-  while :; do
-    prompt filter --no-limit --header "Projects to mount (tab selects, enter confirms)" \
-      ${preselect:+"--selected=$preselect"} \
-      < <(printf '%s\n' ${LABELS[@]+"${LABELS[@]}"} "$OTHER_PATH") || return 1
+  pick "Projects to mount (tab selects, enter confirms)" --multi \
+    ${start:+--bind "start:${start}first"} \
+    < <(printf '%s\n' ${LABELS[@]+"${LABELS[@]}"} "$OTHER_PATH") || return 1
 
-    PICKED=()
-    PICKED_BEFORE=1
-    WANT_OTHER=0
-    while IFS= read -r label; do
-      if [ "$label" = "$OTHER_PATH" ]; then
-        WANT_OTHER=1
-        continue
-      fi
-      for ((i = 0; i < ${#LABELS[@]}; i++)); do
-        [ "${LABELS[$i]}" != "$label" ] || PICKED+=("${DIRS[$i]}")
-      done
-    done <<EOF
+  PICKED=()
+  PICKED_BEFORE=1
+  WANT_OTHER=0
+  while IFS= read -r label; do
+    if [ "$label" = "$OTHER_PATH" ]; then
+      WANT_OTHER=1
+      continue
+    fi
+    for ((i = 0; i < ${#LABELS[@]}; i++)); do
+      [ "${LABELS[$i]}" != "$label" ] || PICKED+=("${DIRS[$i]}")
+    done
+  done <<EOF
 $ANSWER
 EOF
-    [ "${#PICKED[@]}" -eq 0 ] && [ "$WANT_OTHER" -eq 0 ] || return 0
-    warn "Select at least one project"
-  done
 }
 
 EXTRA=()
@@ -420,8 +428,7 @@ create_sandbox() {
 
 # Step: set NAME to the sandbox to open.
 step_pick_one() {
-  prompt filter --header "Sandbox to open" < <(printf '%s\n' "$SANDBOXES") || return 1
-  [ -n "$ANSWER" ] || return 1
+  pick "Sandbox to open" < <(printf '%s\n' "$SANDBOXES") || return 1
   NAME="$ANSWER"
 }
 
@@ -439,18 +446,14 @@ open_sandbox() {
 # Set NAMES to the sandboxes picked; returns 1 on Esc.
 pick_sandboxes() {
   local name
-  while :; do
-    prompt filter --no-limit --header "$1 (tab selects, enter confirms)" \
-      < <(printf '%s\n' "$SANDBOXES") || return 1
-    NAMES=()
-    while IFS= read -r name; do
-      [ -z "$name" ] || NAMES+=("$name")
-    done <<EOF
+  pick "$1 (tab selects, enter confirms)" --multi < <(printf '%s\n' "$SANDBOXES") ||
+    return 1
+  NAMES=()
+  while IFS= read -r name; do
+    [ -z "$name" ] || NAMES+=("$name")
+  done <<EOF
 $ANSWER
 EOF
-    [ "${#NAMES[@]}" -eq 0 ] || return 0
-    warn "Select at least one sandbox"
-  done
 }
 
 step_pick_stop() {
@@ -486,6 +489,7 @@ main() {
   done
 
   require gum "brew install gum"
+  require fzf "brew install fzf"
   require sbx "brew trust docker/tap && brew install docker/tap/sbx"
 
   SANDBOXES=$(sbx ls -q) || die "could not list sandboxes; run 'sbx login' if you are not signed in"

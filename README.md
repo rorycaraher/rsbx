@@ -1,6 +1,6 @@
 # rsbx
 
-Interactive launcher for Claude Code in [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/). Opens, creates, stops and removes sandboxes via `gum` menus.
+Interactive launcher for Claude Code in [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/). Opens, creates, stops and removes sandboxes via `gum` and `fzf` menus.
 
 ## Install
 
@@ -20,7 +20,7 @@ rsbx            # interactive
 rsbx --dry-run  # print the sbx command instead of running it
 ```
 
-Esc goes back one step (for example, from the sandbox picker back to the main menu, so you can choose "Create" instead). Esc on the main menu, or Ctrl-C at any point, quits. In filter lists, gum's first Esc leaves the search box and the second goes back.
+Esc goes back one step (for example, from the sandbox picker back to the main menu, so you can choose "Create" instead). Esc on the main menu, or Ctrl-C at any point, quits.
 
 Pick projects from the directories in `$GIT_PROJECTS_ROOT` (default: `~`) to mount into the sandbox VM at the same paths as on the host. Claude starts in the one you choose as primary. `GIT_PROJECTS_ROOT` takes a colon-separated list, like `PATH`, so projects can stay in separate directories (for example, one per org with its own git identity):
 
