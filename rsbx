@@ -3,7 +3,6 @@
 # Written for bash 3.2, the version macOS ships.
 set -eu
 
-PROJECTS_DIR="${GIT_PROJECTS_ROOT:-$HOME}"
 OTHER_PATH="+ other path..."
 DRY_RUN=0
 
@@ -12,12 +11,14 @@ usage() {
 Usage: rsbx [-n|--dry-run] [-h|--help]
 
 Choose an existing sandbox or configure a new one, then launch Claude Code.
+Esc goes back one step; Ctrl-C quits.
 
   -n, --dry-run   Print the sbx command that launches a sandbox, without running it
   -h, --help      Show this help
 
 Environment:
-  GIT_PROJECTS_ROOT   Directory listing mountable projects (default: ~)
+  GIT_PROJECTS_ROOT   Colon-separated directories whose subdirectories are
+                      offered as projects to mount (default: ~)
 EOF
 }
 
@@ -119,12 +120,50 @@ sync_skills() {
     gum log --level warn "Could not import skills; run 'sbx skills import' to see why"
 }
 
-# Yes/no prompt defaulting to no. Ctrl-C quits rather than answering no.
-ask() {
+# Run gum with the given arguments, storing its output in ANSWER. Returns 1
+# when the user presses Esc, so the caller can go back a step; exits rsbx on
+# Ctrl-C. Runs in the current shell (not $(...)) so that the exit is real.
+prompt() {
   local status=0
-  gum confirm --default=false "$1" || status=$?
+  ANSWER=$(gum "$@") || status=$?
   [ "$status" -ne 130 ] || exit 130
   return "$status"
+}
+
+# Yes/no question, defaulting to no. Sets ANSWER to Yes or No; returns 1 on
+# Esc. Uses gum choose because gum confirm reports Esc the same as No.
+ask() {
+  prompt choose --header "$1" --selected No Yes No
+}
+
+warn() {
+  gum log --level warn "$1" >&2
+}
+
+# A step is a function taking no arguments that returns 0 to move forward,
+# 1 to go back (Esc), or SKIP when it doesn't apply, which keeps moving in
+# the same direction so that going back passes over it too.
+#
+# Steps run in a conditional context, where bash turns off set -e, so they
+# check for errors themselves. Keep side effects out of them: do the work
+# after run_steps returns.
+SKIP=2
+
+# Run the steps named in $@ in order, letting Esc step backwards. Returns 1
+# if the user backs out of the first step.
+run_steps() {
+  local steps=("$@") i=0 dir=1 status
+  while [ "$i" -lt "${#steps[@]}" ]; do
+    status=0
+    "${steps[$i]}" || status=$?
+    case "$status" in
+      0) dir=1 ;;
+      "$SKIP") ;;
+      *) dir=-1 ;;
+    esac
+    i=$((i + dir))
+    [ "$i" -ge 0 ] || return 1
+  done
 }
 
 # Absolute path of a directory, expanding a leading ~.
@@ -137,84 +176,160 @@ resolve_dir() {
   (cd -- "$1" 2>/dev/null && pwd)
 }
 
-add_project() {
-  local existing
-  for existing in ${PROJECTS[@]+"${PROJECTS[@]}"}; do
-    [ "$existing" = "$1" ] && return
-  done
-  PROJECTS+=("$1")
-}
-
-select_projects() {
-  local listing="" preselect=() chosen choice entered path dir
-
-  for dir in "$PROJECTS_DIR"/*/; do
-    [ -d "$dir" ] || continue
-    dir="${dir%/}"
-    listing="$listing${dir##*/}"$'\n'
-  done
-
-  # gum splits --selected on commas, so a name containing one can't be preselected.
-  case "$PWD" in
-    "$PROJECTS_DIR"/*/* | *,*) ;;
-    "$PROJECTS_DIR"/*) preselect=("--selected=${PWD##*/}") ;;
+# $1 with a leading $HOME shown as ~.
+tilde() {
+  # shellcheck disable=SC2088  # printing a tilde, not expanding one
+  case "$1" in
+    "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;;
+    *) printf '%s' "$1" ;;
   esac
-
-  chosen=$(printf '%s%s\n' "$listing" "$OTHER_PATH" |
-    gum filter --no-limit --header "Projects to mount (tab selects, enter confirms)" \
-      ${preselect[@]+"${preselect[@]}"})
-
-  # Read from fd 3 so that gum input below keeps the terminal on stdin.
-  PROJECTS=()
-  while IFS= read -r choice <&3; do
-    if [ "$choice" = "$OTHER_PATH" ]; then
-      while :; do
-        # shellcheck disable=SC2088  # literal placeholder text
-        entered=$(gum input --header "Directory to mount (empty to finish)" \
-          --placeholder "~/path/to/project")
-        [ -n "$entered" ] || break
-        if path=$(resolve_dir "$entered"); then
-          add_project "$path"
-        else
-          gum log --level warn "Not a directory: $entered"
-        fi
-      done
-    elif [ -n "$choice" ]; then
-      add_project "$PROJECTS_DIR/$choice"
-    fi
-  done 3<<EOF
-$chosen
-EOF
-
-  [ "${#PROJECTS[@]}" -gt 0 ] || die "no projects selected"
 }
 
-# Reorder PROJECTS so the workspace the agent starts in comes first.
-select_primary() {
-  local primary path others=()
-  [ "${#PROJECTS[@]}" -gt 1 ] || return 0
+# Set ROOTS from GIT_PROJECTS_ROOT, a colon-separated list like PATH.
+load_roots() {
+  local entries=() entry dir
+  IFS=: read -r -a entries <<EOF
+${GIT_PROJECTS_ROOT:-$HOME}
+EOF
+  ROOTS=()
+  for entry in ${entries[@]+"${entries[@]}"}; do
+    [ -n "$entry" ] || continue
+    if dir=$(resolve_dir "$entry"); then
+      ROOTS+=("$dir")
+    else
+      warn "GIT_PROJECTS_ROOT entry is not a directory: $entry"
+    fi
+  done
+}
 
-  primary=$(printf '%s\n' "${PROJECTS[@]}" | gum choose --header "Primary workspace (Claude starts here)")
-  [ -n "$primary" ] || die "no primary workspace selected"
+# Set DIRS to the projects in ROOTS, and LABELS to how the menu shows each:
+# the bare name with one root, otherwise the path (with ~), so that projects
+# with the same name in different roots stay distinct.
+list_projects() {
+  local root dir
+  DIRS=()
+  LABELS=()
+  for root in ${ROOTS[@]+"${ROOTS[@]}"}; do
+    for dir in "$root"/*/; do
+      [ -d "$dir" ] || continue
+      dir="${dir%/}"
+      DIRS+=("$dir")
+      if [ "${#ROOTS[@]}" -eq 1 ]; then
+        LABELS+=("${dir##*/}")
+      else
+        LABELS+=("$(tilde "$dir")")
+      fi
+    done
+  done
+}
+
+# Whether $1 is one of the remaining arguments.
+contains() {
+  local needle="$1" item
+  shift
+  for item in "$@"; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+PICKED=()
+PICKED_BEFORE=0
+WANT_OTHER=0
+
+# Step: choose projects from the roots. Sets PICKED and WANT_OTHER.
+step_projects() {
+  local preselect="" label i
+  # Preselect the previous picks when coming back, else the project at $PWD.
+  # gum splits --selected on commas, so a name containing one can't be preselected.
+  [ "$PICKED_BEFORE" -eq 1 ] || PICKED=("$PWD")
+  for ((i = 0; i < ${#DIRS[@]}; i++)); do
+    label="${LABELS[$i]}"
+    case "$label" in *,*) continue ;; esac
+    if contains "${DIRS[$i]}" ${PICKED[@]+"${PICKED[@]}"}; then
+      preselect="${preselect:+$preselect,}$label"
+    fi
+  done
+  [ "$WANT_OTHER" -eq 0 ] || preselect="${preselect:+$preselect,}$OTHER_PATH"
+
+  while :; do
+    prompt filter --no-limit --header "Projects to mount (tab selects, enter confirms)" \
+      ${preselect:+"--selected=$preselect"} \
+      < <(printf '%s\n' ${LABELS[@]+"${LABELS[@]}"} "$OTHER_PATH") || return 1
+
+    PICKED=()
+    PICKED_BEFORE=1
+    WANT_OTHER=0
+    while IFS= read -r label; do
+      if [ "$label" = "$OTHER_PATH" ]; then
+        WANT_OTHER=1
+        continue
+      fi
+      for ((i = 0; i < ${#LABELS[@]}; i++)); do
+        [ "${LABELS[$i]}" != "$label" ] || PICKED+=("${DIRS[$i]}")
+      done
+    done <<EOF
+$ANSWER
+EOF
+    [ "${#PICKED[@]}" -eq 0 ] && [ "$WANT_OTHER" -eq 0 ] || return 0
+    warn "Select at least one project"
+  done
+}
+
+EXTRA=()
+
+# Step: type in directories outside the roots, if "other path" was chosen.
+step_other_paths() {
+  local path
+  EXTRA=()
+  [ "$WANT_OTHER" -eq 1 ] || return "$SKIP"
+  while :; do
+    # shellcheck disable=SC2088  # literal placeholder text
+    prompt input --header "Directory to mount (empty to finish)" \
+      --placeholder "~/path/to/project" || return 1
+    if [ -z "$ANSWER" ]; then
+      [ "${#PICKED[@]}" -eq 0 ] && [ "${#EXTRA[@]}" -eq 0 ] || return 0
+      warn "Enter at least one directory"
+    elif path=$(resolve_dir "$ANSWER"); then
+      contains "$path" ${EXTRA[@]+"${EXTRA[@]}"} || EXTRA+=("$path")
+    else
+      warn "Not a directory: $ANSWER"
+    fi
+  done
+}
+
+# Step: set PROJECTS to the chosen directories, with the workspace the agent
+# starts in first.
+step_primary() {
+  local path others=()
+  PROJECTS=()
+  for path in ${PICKED[@]+"${PICKED[@]}"} ${EXTRA[@]+"${EXTRA[@]}"}; do
+    contains "$path" ${PROJECTS[@]+"${PROJECTS[@]}"} || PROJECTS+=("$path")
+  done
+  [ "${#PROJECTS[@]}" -gt 1 ] || return "$SKIP"
+
+  prompt choose --header "Primary workspace (Claude starts here)" "${PROJECTS[@]}" ||
+    return 1
 
   for path in "${PROJECTS[@]}"; do
-    [ "$path" = "$primary" ] || others+=("$path")
+    [ "$path" = "$ANSWER" ] || others+=("$path")
   done
-  PROJECTS=("$primary" "${others[@]}")
+  PROJECTS=("$ANSWER" "${others[@]}")
 }
 
-# sbx only accepts :ro on extra workspaces, so the primary is always writable.
-build_mounts() {
-  local read_only="" path i
+# Step: set MOUNTS. sbx only accepts :ro on extra workspaces, so the primary
+# is always writable.
+step_mounts() {
+  local path i
   MOUNTS=("${PROJECTS[0]}")
-  [ "${#PROJECTS[@]}" -gt 1 ] || return 0
+  [ "${#PROJECTS[@]}" -gt 1 ] || return "$SKIP"
 
-  read_only=$(printf '%s\n' "${PROJECTS[@]:1}" |
-    gum choose --no-limit --header "Mount read-only (none selected: all writable)")
+  prompt choose --no-limit --header "Mount read-only (none selected: all writable)" \
+    "${PROJECTS[@]:1}" || return 1
 
   for ((i = 1; i < ${#PROJECTS[@]}; i++)); do
     path="${PROJECTS[$i]}"
-    if printf '%s\n' "$read_only" | grep -Fxq -- "$path"; then
+    if printf '%s\n' "$ANSWER" | grep -Fxq -- "$path"; then
       MOUNTS+=("$path:ro")
     else
       MOUNTS+=("$path")
@@ -228,97 +343,133 @@ default_name() {
   printf 'claude-%s' "$base"
 }
 
-# Runs inside $(...), where bash turns off set -e, so cancelling must exit explicitly.
-select_name() {
-  local suggested="$1" name
+# Step: set NAME.
+step_name() {
+  local name
+  name=$(default_name "${PROJECTS[0]}")
   while :; do
-    name=$(gum input --header "Sandbox name" --value "$suggested") || exit 130
+    prompt input --header "Sandbox name" --value "$name" || return 1
+    name="$ANSWER"
     if ! printf '%s' "$name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.-]+$' || [ "$name" = default ]; then
-      gum log --level warn "Use 2+ letters, numbers, hyphens or periods, starting with a letter or number (not 'default')" >&2
+      warn "Use 2+ letters, numbers, hyphens or periods, starting with a letter or number (not 'default')"
     elif printf '%s\n' "$SANDBOXES" | grep -Fxq -- "$name"; then
-      gum log --level warn "A sandbox named $name already exists" >&2
+      warn "A sandbox named $name already exists"
     else
-      printf '%s' "$name"
-      return
+      NAME="$name"
+      return 0
     fi
-    suggested="$name"
   done
 }
 
+# Step: set CLONE. A .git file marks a linked worktree, which sbx refuses to
+# clone from.
+step_clone() {
+  CLONE=0
+  [ -d "${PROJECTS[0]}/.git" ] || return "$SKIP"
+  ask "Use clone mode? Claude works on a private clone instead of your checkout" || return 1
+  [ "$ANSWER" != Yes ] || CLONE=1
+}
+
+# Steps: set LIMITS, CPUS and MEMORY.
+step_limits() {
+  LIMITS=0
+  ask "Set CPU and memory limits?" || return 1
+  [ "$ANSWER" != Yes ] || LIMITS=1
+}
+
+step_cpus() {
+  CPUS=""
+  [ "$LIMITS" -eq 1 ] || return "$SKIP"
+  prompt input --header "CPUs (empty: all host CPUs)" --placeholder "4" || return 1
+  CPUS="$ANSWER"
+}
+
+step_memory() {
+  MEMORY=""
+  [ "$LIMITS" -eq 1 ] || return "$SKIP"
+  prompt input --header "Memory (empty: 50% of host memory)" --placeholder "8g" || return 1
+  MEMORY="$ANSWER"
+}
+
+CREATE_STEPS=(step_projects step_other_paths step_primary step_mounts step_name
+  step_clone step_limits step_cpus step_memory)
+
+# Prompt for a new sandbox's settings. Returns 1 if the user backs out.
+configure_sandbox() {
+  load_roots
+  list_projects
+  PICKED=()
+  PICKED_BEFORE=0
+  WANT_OTHER=0
+  run_steps "${CREATE_STEPS[@]}"
+}
+
 create_sandbox() {
-  local name memory="" cpus="" flags=()
-
-  select_projects
-  select_primary
-  build_mounts
-  name=$(default_name "${PROJECTS[0]}")
-  name=$(select_name "$name")
-
-  # A .git file marks a linked worktree, which sbx refuses to clone from.
-  if [ -d "${PROJECTS[0]}/.git" ] &&
-    ask "Use clone mode? Claude works on a private clone instead of your checkout"; then
-    flags+=(--clone)
-  fi
-
-  if ask "Set CPU and memory limits?"; then
-    cpus=$(gum input --header "CPUs (empty: all host CPUs)" --placeholder "4")
-    memory=$(gum input --header "Memory (empty: 50% of host memory)" --placeholder "8g")
-    [ -z "$cpus" ] || flags+=(--cpus "$cpus")
-    [ -z "$memory" ] || flags+=(--memory "$memory")
-  fi
+  local flags=()
+  [ "$CLONE" -eq 0 ] || flags+=(--clone)
+  [ -z "$CPUS" ] || flags+=(--cpus "$CPUS")
+  [ -z "$MEMORY" ] || flags+=(--memory "$MEMORY")
 
   sync_skills
-  step sbx create --name "$name" ${flags[@]+"${flags[@]}"} claude "${MOUNTS[@]}" ||
-    die "could not create sandbox $name"
-  set_github_secret "$name"
-  set_git_identity "$name" "${PROJECTS[0]}"
-  launch sbx run --name "$name"
+  step sbx create --name "$NAME" ${flags[@]+"${flags[@]}"} claude "${MOUNTS[@]}" ||
+    die "could not create sandbox $NAME"
+  set_github_secret "$NAME"
+  set_git_identity "$NAME" "${PROJECTS[0]}"
+  launch sbx run --name "$NAME"
+}
+
+# Step: set NAME to the sandbox to open.
+step_pick_one() {
+  prompt filter --header "Sandbox to open" < <(printf '%s\n' "$SANDBOXES") || return 1
+  [ -n "$ANSWER" ] || return 1
+  NAME="$ANSWER"
 }
 
 open_sandbox() {
-  local name dir=""
-  name=$(printf '%s\n' "$SANDBOXES" | gum filter --header "Sandbox to open")
-  [ -n "$name" ] || die "no sandbox selected"
+  local dir=""
   sync_skills
   # Workspaces are mounted at their host paths, so the sandbox's working
   # directory is the primary project on the host too. Skipped in a dry run
   # because exec starts a stopped sandbox.
-  [ "$DRY_RUN" -eq 1 ] || dir=$(sbx exec "$name" pwd 2>/dev/null) || dir=""
-  set_git_identity "$name" "$dir"
-  launch sbx run --name "$name"
+  [ "$DRY_RUN" -eq 1 ] || dir=$(sbx exec "$NAME" pwd 2>/dev/null) || dir=""
+  set_git_identity "$NAME" "$dir"
+  launch sbx run --name "$NAME"
 }
 
-# Set NAMES to the sandboxes picked; exits if there are none.
+# Set NAMES to the sandboxes picked; returns 1 on Esc.
 pick_sandboxes() {
-  local chosen name
-  chosen=$(printf '%s\n' "$SANDBOXES" |
-    gum filter --no-limit --header "$1 (tab selects, enter confirms)")
-
-  NAMES=()
-  while IFS= read -r name; do
-    [ -z "$name" ] || NAMES+=("$name")
-  done <<EOF
-$chosen
+  local name
+  while :; do
+    prompt filter --no-limit --header "$1 (tab selects, enter confirms)" \
+      < <(printf '%s\n' "$SANDBOXES") || return 1
+    NAMES=()
+    while IFS= read -r name; do
+      [ -z "$name" ] || NAMES+=("$name")
+    done <<EOF
+$ANSWER
 EOF
-  [ "${#NAMES[@]}" -gt 0 ] || exit 0
+    [ "${#NAMES[@]}" -eq 0 ] || return 0
+    warn "Select at least one sandbox"
+  done
 }
 
-stop_sandboxes() {
+step_pick_stop() {
   pick_sandboxes "Sandboxes to stop"
-  sbx stop "${NAMES[@]}"
 }
 
-remove_sandboxes() {
+step_pick_remove() {
   pick_sandboxes "Sandboxes to remove"
-  # gum replaces sbx's own prompt. --force also deletes a sandbox that's in use.
+}
+
+# Step: gum replaces sbx's own prompt. --force also deletes a sandbox that's
+# in use. No goes back to the list.
+step_confirm_remove() {
   ask "Permanently remove ${NAMES[*]}? This works even if in use, and unpushed clone-mode work is lost." ||
-    exit 0
-  sbx rm --force "${NAMES[@]}"
+    return 1
+  [ "$ANSWER" = Yes ]
 }
 
 main() {
-  local action
-
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -n | --dry-run) DRY_RUN=1 ;;
@@ -340,21 +491,39 @@ main() {
   SANDBOXES=$(sbx ls -q) || die "could not list sandboxes; run 'sbx login' if you are not signed in"
 
   if [ -z "$SANDBOXES" ]; then
+    configure_sandbox || exit 0
     create_sandbox
     return
   fi
 
   sbx ls
   echo
-  action=$(gum choose --header "What do you want to do?" \
-    "Open an existing sandbox" "Create a new sandbox" "Stop sandboxes" "Remove sandboxes")
+  # Esc in an action's first prompt comes back here; Esc here quits.
+  while :; do
+    prompt choose --header "What do you want to do?" \
+      "Open an existing sandbox" "Create a new sandbox" "Stop sandboxes" "Remove sandboxes" ||
+      exit 0
 
-  case "$action" in
-    "Open an existing sandbox") open_sandbox ;;
-    "Create a new sandbox") create_sandbox ;;
-    "Stop sandboxes") stop_sandboxes ;;
-    "Remove sandboxes") remove_sandboxes ;;
-  esac
+    case "$ANSWER" in
+      "Open an existing sandbox")
+        run_steps step_pick_one || continue
+        open_sandbox
+        ;;
+      "Create a new sandbox")
+        configure_sandbox || continue
+        create_sandbox
+        ;;
+      "Stop sandboxes")
+        run_steps step_pick_stop || continue
+        sbx stop "${NAMES[@]}"
+        ;;
+      "Remove sandboxes")
+        run_steps step_pick_remove step_confirm_remove || continue
+        sbx rm --force "${NAMES[@]}"
+        ;;
+    esac
+    return
+  done
 }
 
 main "$@"
